@@ -1,102 +1,124 @@
-import pika
-import json
 import requests
-import threading
-from dotenv import load_dotenv
 import os
+import json
+import pika
+import threading
 
-load_dotenv()
-VENICE_API_KEY = os.getenv("VENICE_API_KEY")
+# Global state: {chat_history_path: {"messages": [...], "active": True, "inactivity_timer": Timer}}
+buffers = {}  # Primary 30s message buffer
+inactivity_timers = {}  # Secondary 10m timer for idle chats
 
-# Global buffer by chat history
-buffers = {}  # {chat_history_path: {"messages": [], "timer": None}}
-
-def process_batch(chat_history_path):
-    global buffers
-    buffer = buffers.get(chat_history_path)
-    if not buffer or not buffer["messages"]:
-        return
-
+def process_batch(chat_path):
+    # Process buffered messages (30s batch)
+    global buffers, inactivity_timers
+    
+    buffer = buffers.get(chat_path, {"messages": []})
+    
     try:
-        # Load existing chat
-        if os.path.exists(chat_history_path):
-            with open(chat_history_path, 'r') as f:
+        # Load full chat history
+        if os.path.exists(chat_path):
+            with open(chat_path, "r", encoding="utf-8") as f:
                 chat = json.load(f)
         else:
             chat = []
-
-        # Append buffered messages to chat
+        
+        # Append buffered messages
         chat.extend(buffer["messages"])
         
         # Send to LLM
-        url = 'https://api.venice.ai/api/v1/chat/completions'
-        headers = {'Authorization': f'Bearer {VENICE_API_KEY}', 'Content-Type': 'application/json'}
-        data = {
+        url = "https://api.venice.ai/api/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {os.environ['VENICE_API_KEY']}", "Content-Type": "application/json"}
+        payload = {
             "model": "venice-uncensored",
             "messages": chat,
             "temperature": 0.7,
             "top_p": 0.9,
             "n": 1,
-            "presence_penalty": 0,
-            "frequency_penalty": 0,
-            "parallel_tool_calls": False,
             "venice_parameters": {"include_venice_system_prompt": False}
         }
         
-        response = requests.post(url=url, headers=headers, json=data).json()
-        assistant_response = response['choices'][0]['message']['content']
+        llm_response = requests.post(url, headers=headers, json=payload).json()
+        assistant_content = llm_response["choices"][0]["message"]["content"]
         
-        # Append response to chat
-        chat.append({"role": "assistant", "content": assistant_response})
-        
-        # Save chat history
-        with open(chat_history_path, "w", encoding="utf-8") as f:
+        # Append LLM response to chat history
+        chat.append({"role": "assistant", "content": assistant_content})
+        with open(chat_path, "w", encoding="utf-8") as f:
             json.dump(chat, f, indent=4)
-            
-        print("Processed batch for", chat_history_path)
         
-    except Exception as e:
-        print(f"Error processing {chat_history_path}:", e)
+        print(f"LLM response for {chat_path}: {assistant_content}")
     
-    # Reset buffer and timer
-    buffers[chat_history_path]["messages"] = []
-    buffers[chat_history_path]["timer"] = None
+    except Exception as e:
+        print(f"Error in LLM processing: {e}")
+    
+    # Reset buffer
+    buffers[chat_path] = {"messages": []}
+    
+    # Start 10m inactivity timer
+    start_inactivity_timer(chat_path)
+
+def start_inactivity_timer(chat_path):
+    # Cancel existing timer if any
+    if chat_path in inactivity_timers and inactivity_timers[chat_path]:
+        inactivity_timers[chat_path].cancel()
+    
+    # Start new 10m timer
+    timer = threading.Timer(600, trigger_inactive_chat, args=[chat_path])
+    inactivity_timers[chat_path] = timer
+    timer.start()
+
+def trigger_inactive_chat(chat_path):
+    # Force process the current chat history
+    print(f"10m inactivity trigger for {chat_path}")
+    process_batch(chat_path)
 
 def on_message(channel, method, properties, body):
-    msg_data = json.loads(body.decode('utf-8'))
-    chat_path = msg_data["chat_history"]
+    try:
+        msg_data = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        print("Invalid JSON in message")
+        channel.basic_ack(method.delivery_tag)
+        return
     
-    # Initialize buffer for this chat if not exists
+    chat_path = msg_data.get("chat_history", "default.json")
+    
+    # Initialize buffer if not exists
     if chat_path not in buffers:
         buffers[chat_path] = {"messages": [], "timer": None}
     
-    # Add system prompt if provided
-    if msg_data["system_prompt"]:
-        buffers[chat_path]["messages"].append({
-            "role": "system",
-            "content": msg_data["system_prompt"]
-        })
+    # Reset inactivity timer if we received a new message
+    if chat_path in inactivity_timers and inactivity_timers[chat_path]:
+        inactivity_timers[chat_path].cancel()
+        inactivity_timers[chat_path] = None
     
-    # Add user message
-    buffers[chat_path]["messages"].append({
-        "role": "user",
-        "content": msg_data["message"]
-    })
+    # Build message from payload
+    new_messages = []
+    if msg_data.get("system_prompt"):
+        new_messages.append({"role": "system", "content": msg_data["system_prompt"]})
+    if msg_data.get("message"):
+        new_messages.append({"role": "user", "content": msg_data["message"]})
     
-    # Start timer if not already running
-    if buffers[chat_path]["timer"] is None:
+    # Append to buffer
+    buffers[chat_path]["messages"].extend(new_messages)
+    
+    # Start 30s batch timer if not running
+    if not buffers[chat_path]["timer"]:
         buffers[chat_path]["timer"] = threading.Timer(30, process_batch, args=[chat_path])
         buffers[chat_path]["timer"].start()
     
-    # Acknowledge receipt (not final processing)
     channel.basic_ack(method.delivery_tag)
 
 # RabbitMQ setup
-connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+connection = pika.BlockingConnection(
+    pika.ConnectionParameters(
+        host="localhost",
+        port=5672,
+        credentials=pika.PlainCredentials("guest", "guest"),
+    )
+)
 channel = connection.channel()
-channel.queue_declare(queue='llm_messages', durable=True)
+channel.queue_declare(queue="llm_messages", durable=True)
 
 # Start consuming
-channel.basic_consume(queue='llm_messages', on_message_callback=on_message)
-print("Consumer waiting for messages...")
+channel.basic_consume(queue="llm_messages", on_message_callback=on_message, auto_ack=False)
+print("Consumer started. Waiting for messages...")
 channel.start_consuming()
