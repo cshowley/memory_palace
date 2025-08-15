@@ -1,8 +1,7 @@
-import requests
-import os
 import argparse
 import json
 import pika
+
 
 def send_to_rabbitmq(chat_history_path, message, system_prompt=None):
     # Connect to RabbitMQ

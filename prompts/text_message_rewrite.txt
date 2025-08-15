@@ -1,0 +1,1 @@
+Reformat the following message as a series of text messages that preserves the intent and tone of the original message. Each text may not exceed 280 characters. Minimal use of emojis and slang. Begin each message with a newline character.

@@ -3,11 +3,15 @@ import os
 import json
 import pika
 import threading
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # Global state: {chat_history_path: {"messages": [...], "active": True, "inactivity_timer": Timer}}
 buffers = {}  # Primary 30s message buffer
 inactivity_timers = {}  # Secondary 10m timer for idle chats
 
+textify_sysprompt = open('./prompts/text_message_rewrite.txt').read().strip()
 def process_batch(chat_path):
     # Process buffered messages (30s batch)
     global buffers, inactivity_timers
@@ -39,11 +43,37 @@ def process_batch(chat_path):
         
         llm_response = requests.post(url, headers=headers, json=payload).json()
         assistant_content = llm_response["choices"][0]["message"]["content"]
+        print(f"<<Raw>> LLM response for {chat_path}: {assistant_content}")
+        def textify(message):
+            payload = {
+                "model": "venice-uncensored",
+                "messages": [
+                    {
+                        "role":"system",
+                        "content": textify_sysprompt
+                    },
+                    {
+                        "role":"user",
+                        "content": message
+                    },    
+                ],
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "n": 1,
+                "venice_parameters": {"include_venice_system_prompt": False}
+            }
+            llm_response = requests.post(url, headers=headers, json=payload).json()
+            text_content = llm_response["choices"][0]["message"]["content"]
+            output = [message for message in text_content.split('\n') if message != '']
+            return output
         
-        # Append LLM response to chat history
-        chat.append({"role": "assistant", "content": assistant_content})
-        with open(chat_path, "w", encoding="utf-8") as f:
-            json.dump(chat, f, indent=4)
+
+        assistant_content = textify(assistant_content)
+        for message in assistant_content:
+            # Append LLM response to chat history
+            chat.append({"role": "assistant", "content": message})
+            with open(chat_path, "w", encoding="utf-8") as f:
+                json.dump(chat, f, indent=4)
         
         print(f"LLM response for {chat_path}: {assistant_content}")
     
@@ -51,7 +81,7 @@ def process_batch(chat_path):
         print(f"Error in LLM processing: {e}")
     
     # Reset buffer
-    buffers[chat_path] = {"messages": []}
+    buffers[chat_path] = {"messages": [], "timer": None}
     
     # Start 10m inactivity timer
     start_inactivity_timer(chat_path)
@@ -61,8 +91,9 @@ def start_inactivity_timer(chat_path):
     if chat_path in inactivity_timers and inactivity_timers[chat_path]:
         inactivity_timers[chat_path].cancel()
     
-    # Start new 10m timer
-    timer = threading.Timer(600, trigger_inactive_chat, args=[chat_path])
+    # Start new timer
+    wait_time = 6000 # count of seconds until LLM response request is triggered for inactivity
+    timer = threading.Timer(wait_time, trigger_inactive_chat, args=[chat_path])
     inactivity_timers[chat_path] = timer
     timer.start()
 
@@ -80,7 +111,7 @@ def on_message(channel, method, properties, body):
         return
     
     chat_path = msg_data.get("chat_history", "default.json")
-    
+
     # Initialize buffer if not exists
     if chat_path not in buffers:
         buffers[chat_path] = {"messages": [], "timer": None}
@@ -101,8 +132,9 @@ def on_message(channel, method, properties, body):
     buffers[chat_path]["messages"].extend(new_messages)
     
     # Start 30s batch timer if not running
+    batch_message_timer = 30
     if not buffers[chat_path]["timer"]:
-        buffers[chat_path]["timer"] = threading.Timer(30, process_batch, args=[chat_path])
+        buffers[chat_path]["timer"] = threading.Timer(batch_message_timer, process_batch, args=[chat_path])
         buffers[chat_path]["timer"].start()
     
     channel.basic_ack(method.delivery_tag)
