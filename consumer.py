@@ -47,7 +47,39 @@ def process_batch(chat_path):
             "venice_parameters": {"include_venice_system_prompt": False},
         }
 
+        special_subject = "coping with anxiety"
+        supervisor_payload = {
+            "model": "qwen3-235b",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"Given the following conversation thread formatted as a JSON object, determine if the response for the assistant should suggest changing the subject to '{special_subject}', respond only with YES or NO.",
+                },
+                {"role": "user", "content": f"{chat[1:]}"},
+            ],
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "n": 1,
+            "venice_parameters": {"include_venice_system_prompt": False},
+        }
+        supervisor_llm_response = requests.post(
+            url, headers=headers, json=supervisor_payload
+        ).json()["choices"][0]["message"]["content"]
+        print(f"Supervisor response: {supervisor_llm_response}")
+        supervisor_llm_response = supervisor_llm_response.split("</think>")[-1].strip()
+        print(f"Stripped supervisor response: {supervisor_llm_response}")
+        if supervisor_llm_response == "YES":
+            # Inject conversation steering system prompt
+            # Example: psychiatry chat, engage with patient and then ask about how they are managing their anxiety
+            chat.extend(
+                {
+                    "role": "system",
+                    "content": f"Suggest changing the topic of conversation to {special_subject}",
+                }
+            )
+
         llm_response = requests.post(url, headers=headers, json=payload).json()
+
         assistant_content = llm_response["choices"][0]["message"]["content"]
         print(f"<<Raw>> LLM response for {chat_path}: {assistant_content}")
 
@@ -136,8 +168,12 @@ def on_message(channel, method, properties, body):
     # Append to buffer
     buffers[chat_path]["messages"].extend(new_messages)
 
+    print(msg_data)
     # Start 30s batch timer if not running
-    batch_message_timer = 30
+    if False:  # msg_data["instant_reply"] == True:
+        batch_message_timer = 0
+    else:
+        batch_message_timer = 30
     if not buffers[chat_path]["timer"]:
         buffers[chat_path]["timer"] = threading.Timer(
             batch_message_timer, process_batch, args=[chat_path]
